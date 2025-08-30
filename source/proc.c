@@ -1,3 +1,4 @@
+```c
 #include <stddef.h>
 #include <signal.h>
 #include <assert.h>
@@ -13,63 +14,38 @@
 static void idle(void);
 static int mini_receive(struct proc *caller_ptr, endpoint_t src, message *m_buff_usr, int flags);
 static int mini_senda(struct proc *caller_ptr, asynmsg_t *table, size_t size);
-static int deadlock(int function, struct proc *caller, endpoint_t src_dst_e);
+static int deadlock(struct proc *caller, endpoint_t src_dst_e, int is_send);
 static int try_async(struct proc *caller_ptr);
 static int try_one(endpoint_t receive_e, struct proc *src_ptr, struct proc *dst_ptr);
 static struct proc * pick_proc(void);
 static void enqueue_head(struct proc *rp);
 static void delivermsg(struct proc *rp);
 static int do_sync_ipc(struct proc *caller_ptr, int call_nr, endpoint_t src_dst_e, message *m_ptr);
-static int has_pending(sys_map_t *map, int src_p, int asynm);
+static sys_id_t has_pending(sys_map_t *map, int src_p, int asynm);
 static void notify_scheduler(struct proc *p);
 
 static struct priv idle_priv;
 
+
 static void set_idle_name(char *name, int n)
 {
-    int i;
-    char p_z = 0;
-
+    int i = 4;
     n = (n > 999) ? 999 : n;
-
     memcpy(name, "idle", 4);
-
-    for (i = 4; n > 0 || i == 4; n /= 10, i++) {
+    for (; n > 0 || i == 4; n /= 10, i++) {
         name[i] = '0' + (n % 10);
     }
     name[i] = '\0';
 }
 
 
-#define PICK_ANY  1
-#define PICK_HIGHERONLY    2
-
-#define BuildNotifyMessage(m_ptr, src, dst_ptr) \
-    do { \
-        memset((m_ptr), 0, sizeof(*(m_ptr))); \
-        (m_ptr)->m_type = NOTIFY_MESSAGE; \
-        (m_ptr)->m_notify.timestamp = get_monotonic(); \
-        if (src == HARDWARE) { \
-            (m_ptr)->m_notify.interrupts = priv(dst_ptr)->s_int_pending; \
-            priv(dst_ptr)->s_int_pending = 0; \
-        } else if (src == SYSTEM) { \
-            memcpy(&(m_ptr)->m_notify.sigset, &priv(dst_ptr)->s_sig_pending, sizeof(sigset_t)); \
-            sigemptyset(&priv(dst_ptr)->s_sig_pending); \
-        } \
-    } while(0)
-
-static message m_notify_buff = {0, NOTIFY_MESSAGE};
-
 void proc_init(void)
 {
-    struct proc *rp;
-    struct priv *sp;
     int i;
-
-    for (rp = BEG_PROC_ADDR, i = -NR_TASKS; rp < END_PROC_ADDR; ++rp, ++i) {
+    for (struct proc *rp = BEG_PROC_ADDR, *end = END_PROC_ADDR; rp < end; ++rp) {
         rp->p_rts_flags = RTS_SLOT_FREE;
         rp->p_magic = PMAGIC;
-        rp->p_nr = i;
+        rp->p_nr = BEG_PROC_ADDR - rp - NR_TASKS;
         rp->p_endpoint = _ENDPOINT(0, rp->p_nr);
         rp->p_scheduler = NULL;
         rp->p_priority = 0;
@@ -77,10 +53,10 @@ void proc_init(void)
         arch_proc_reset(rp);
     }
 
-    for (sp = BEG_PRIV_ADDR, i = 0; sp < END_PRIV_ADDR; ++sp, ++i) {
+    for (struct priv *sp = BEG_PRIV_ADDR, *end = END_PRIV_ADDR; sp < end; ++sp) {
         sp->s_proc_nr = NONE;
-        sp->s_id = (sys_id_t)i;
-        ppriv_addr[i] = sp;
+        sp->s_id = sp - BEG_PRIV_ADDR;
+        ppriv_addr[sp->s_id] = sp;
         sp->s_sig_mgr = NONE;
         sp->s_bak_sig_mgr = NONE;
     }
@@ -118,23 +94,22 @@ static void idle(void)
         stop_local_timer();
     else
 #endif
-    {
         restart_local_timer();
-    }
 
     context_stop(proc_addr(KERNEL));
+
 #if !SPROFILE
     halt_cpu();
 #else
     if (!sprofiling)
         halt_cpu();
     else {
-        volatile int *v = get_cpulocal_var_ptr(idle_interrupted);
+        volatile int *idle_interrupted = get_cpulocal_var_ptr(idle_interrupted);
         interrupts_enable();
-        while (!*v)
+        while (!*idle_interrupted)
             arch_pause();
         interrupts_disable();
-        *v = 0;
+        *idle_interrupted = 0;
     }
 #endif
 }
@@ -153,12 +128,12 @@ void vm_suspend(struct proc *caller, const struct proc *target, const vir_bytes 
     caller->p_vmrequest.params.check.writeflag = writeflag;
     caller->p_vmrequest.type = type;
 
-    if(!(caller->p_vmrequest.nextrequestor = vmrequest) && send_sig(VM_PROC_NR, SIGKMEM) != OK)
-        panic("send_sig failed");
-
+    caller->p_vmrequest.nextrequestor = vmrequest;
     vmrequest = caller;
-}
 
+    if(send_sig(VM_PROC_NR, SIGKMEM) != OK)
+        panic("send_sig failed");
+}
 
 static void delivermsg(struct proc *rp)
 {
@@ -166,20 +141,19 @@ static void delivermsg(struct proc *rp)
     assert(rp->p_misc_flags & MF_DELIVERMSG);
     assert(rp->p_delivermsg.m_source != NONE);
 
-    if (copy_msg_to_user(&rp->p_delivermsg, (message *) rp->p_delivermsg_vir)) {
+    if (copy_msg_to_user(&rp->p_delivermsg, (message *) rp->p_delivermsg_vir) == OK) {
+        rp->p_delivermsg.m_source = NONE;
+        rp->p_misc_flags &= ~(MF_DELIVERMSG|MF_MSGFAILED);
+        if(!(rp->p_misc_flags & MF_CONTEXT_SET)) {
+            rp->p_reg.retreg = OK;
+        }
+    } else {
         if(rp->p_misc_flags & MF_MSGFAILED) {
             printf("WARNING wrong user pointer 0x%08lx from process %s / %d\n", rp->p_delivermsg_vir, rp->p_name, rp->p_endpoint);
             cause_sig(rp->p_nr, SIGSEGV);
         } else {
             vm_suspend(rp, rp, rp->p_delivermsg_vir, sizeof(message), VMSTYPE_DELIVERMSG, 1);
             rp->p_misc_flags |= MF_MSGFAILED;
-        }
-    } else {
-        rp->p_delivermsg.m_source = NONE;
-        rp->p_misc_flags &= ~(MF_DELIVERMSG|MF_MSGFAILED);
-
-        if(!(rp->p_misc_flags & MF_CONTEXT_SET)) {
-            rp->p_reg.retreg = OK;
         }
     }
 }
@@ -192,8 +166,9 @@ void switch_to_user(void)
     int tlb_must_refresh = 0;
 #endif
 
+pick_new_proc:
+
     if (!proc_is_runnable(p)) {
-not_runnable_pick_new:
         if (proc_is_preempted(p)) {
             p->p_rts_flags &= ~RTS_PREEMPTED;
             if (proc_is_runnable(p)) {
@@ -203,7 +178,6 @@ not_runnable_pick_new:
                     enqueue(p);
             }
         }
-
 
         while (!(p = pick_proc())) {
             idle();
@@ -220,7 +194,6 @@ not_runnable_pick_new:
     }
 
 
-
     while (p->p_misc_flags & (MF_KCALL_RESUME | MF_DELIVERMSG | MF_SC_DEFER | MF_SC_TRACE | MF_SC_ACTIVE)) {
         assert(proc_is_runnable(p));
 
@@ -235,26 +208,26 @@ not_runnable_pick_new:
             if ((p->p_misc_flags & MF_SIG_DELAY) && !RTS_ISSET(p, RTS_SENDING))
                 sig_delay_done(p);
         } else if (p->p_misc_flags & MF_SC_TRACE) {
-            if (!(p->p_misc_flags & MF_SC_ACTIVE))
-                break;
+            if (p->p_misc_flags & MF_SC_ACTIVE) {
+                p->p_misc_flags &= ~(MF_SC_TRACE | MF_SC_ACTIVE);
+                cause_sig(proc_nr(p), SIGTRAP);
+            } else break; 
 
-            p->p_misc_flags &= ~(MF_SC_TRACE | MF_SC_ACTIVE);
-            cause_sig(proc_nr(p), SIGTRAP);
         } else if (p->p_misc_flags & MF_SC_ACTIVE) {
             p->p_misc_flags &= ~MF_SC_ACTIVE;
             break;
         }
 
+
         if (!proc_is_runnable(p))
-            goto not_runnable_pick_new;
+            goto pick_new_proc;
     }
 
     if (!p->p_cpu_time_left)
         proc_no_time(p);
 
-
     if (!proc_is_runnable(p))
-        goto not_runnable_pick_new;
+        goto pick_new_proc;
 
 
     TRACE(VF_SCHEDULING, printf("cpu %d starting %s / %d pc 0x%08x\n", cpuid, p->p_name, p->p_endpoint, p->p_reg.pc));
@@ -271,7 +244,6 @@ not_runnable_pick_new:
         enable_fpu_exception();
     else
         disable_fpu_exception();
-
 
     p->p_misc_flags &= ~MF_CONTEXT_SET;
 
@@ -298,8 +270,7 @@ not_runnable_pick_new:
 
 static int do_sync_ipc(struct proc * caller_ptr, int call_nr, endpoint_t src_dst_e, message *m_ptr)
 {
-    int result;
-    int src_dst_p;
+    int result, src_dst_p;
     char *callname = ipc_call_names[call_nr];
 
 
@@ -312,27 +283,20 @@ static int do_sync_ipc(struct proc * caller_ptr, int call_nr, endpoint_t src_dst
 
     if (src_dst_e == ANY) {
         if (call_nr != RECEIVE) {
-#if 0
-            printf("sys_call: %s by %d with bad endpoint %d\n", callname, proc_nr(caller_ptr), src_dst_e);
-#endif
             return EINVAL;
         }
         src_dst_p = (int)src_dst_e;
-    } else {
-        if(!isokendpt(src_dst_e, &src_dst_p)) {
-#if 0
-            printf("sys_call: %s by %d with bad endpoint %d\n", callname, proc_nr(caller_ptr), src_dst_e);
-#endif
-            return EDEADSRCDST;
-        }
-
+    } else if(isokendpt(src_dst_e, &src_dst_p)) {
         if (call_nr != RECEIVE && !may_send_to(caller_ptr, src_dst_p)) {
 #if DEBUG_ENABLE_IPC_WARNINGS
             printf("sys_call: ipc mask denied %s from %d to %d\n", callname, caller_ptr->p_endpoint, src_dst_e);
 #endif
             return ECALLDENIED;
         }
+    } else {
+        return EDEADSRCDST;
     }
+
 
 
     if (!(priv(caller_ptr)->s_trap_mask & (1 << call_nr))) {
@@ -388,9 +352,8 @@ int do_ipc(reg_t r1, reg_t r2, reg_t r3)
 
     kbill_ipc = caller_ptr;
 
-    if (caller_ptr->p_misc_flags & (MF_SC_TRACE | MF_SC_DEFER)) {
-        if ((caller_ptr->p_misc_flags & (MF_SC_TRACE | MF_SC_DEFER)) == MF_SC_TRACE) {
-            caller_ptr->p_misc_flags &= ~MF_SC_TRACE;
+    if (caller_ptr->p_misc_flags & MF_SC_TRACE) {
+        if (!(caller_ptr->p_misc_flags & MF_SC_DEFER)) {
             caller_ptr->p_misc_flags |= MF_SC_DEFER;
             caller_ptr->p_defer.r1 = r1;
             caller_ptr->p_defer.r2 = r2;
@@ -398,10 +361,15 @@ int do_ipc(reg_t r1, reg_t r2, reg_t r3)
             cause_sig(proc_nr(caller_ptr), SIGTRAP);
             return caller_ptr->p_reg.retreg;
         }
+        caller_ptr->p_misc_flags &= ~MF_SC_TRACE;
 
+    }
+
+    if (caller_ptr->p_misc_flags & MF_SC_DEFER) {
         caller_ptr->p_misc_flags &= ~MF_SC_DEFER;
         caller_ptr->p_misc_flags |= MF_SC_ACTIVE;
     }
+
 
     if(caller_ptr->p_misc_flags & MF_DELIVERMSG) {
         panic("sys_call: MF_DELIVERMSG on for %s / %d\n", caller_ptr->p_name, caller_ptr->p_endpoint);
@@ -418,17 +386,15 @@ int do_ipc(reg_t r1, reg_t r2, reg_t r3)
     case SENDA: {
         size_t msg_size = (size_t) r2;
         caller_ptr->p_accounting.ipc_async++;
-
         if (msg_size > 16*(NR_TASKS + NR_PROCS))
             return EDOM;
-
         return mini_senda(caller_ptr, (asynmsg_t *) r3, msg_size);
     }
     case MINIX_KERNINFO:
-	if(!minix_kerninfo_user)
-		return EBADCALL;
-	arch_set_secondary_ipc_return(caller_ptr, minix_kerninfo_user);
-	return OK;
+        if(!minix_kerninfo_user)
+            return EBADCALL;
+        arch_set_secondary_ipc_return(caller_ptr, minix_kerninfo_user);
+        return OK;
 
     default:
         return EBADCALL;
@@ -436,10 +402,11 @@ int do_ipc(reg_t r1, reg_t r2, reg_t r3)
 }
 
 
-static int deadlock(int function, struct proc *cp, endpoint_t src_dst_e)
+
+static int deadlock(struct proc *cp, endpoint_t src_dst_e, int is_send)
 {
-    struct proc *xp;
     int group_size = 1;
+    struct proc *xp;
 #if DEBUG_ENABLE_IPC_WARNINGS
     struct proc *processes[NR_PROCS + NR_TASKS];
     processes[0] = cp;
@@ -447,20 +414,25 @@ static int deadlock(int function, struct proc *cp, endpoint_t src_dst_e)
 
     while (src_dst_e != ANY) {
         int src_dst_slot;
+
         okendpt(src_dst_e, &src_dst_slot);
         xp = proc_addr(src_dst_slot);
+
         assert(proc_ptr_ok(xp));
         assert(!RTS_ISSET(xp, RTS_SLOT_FREE));
+
 #if DEBUG_ENABLE_IPC_WARNINGS
         processes[group_size] = xp;
 #endif
         group_size++;
 
+
         if((src_dst_e = P_BLOCKEDON(xp)) == NONE)
             return 0;
 
+
         if (src_dst_e == cp->p_endpoint) {
-            if (group_size == 2 && ((xp->p_rts_flags ^ (function << 2)) & RTS_SENDING)) {
+            if (group_size == 2 && ((xp->p_rts_flags >> 2) & RTS_SENDING) != is_send) {
                 return 0;
             }
 #if DEBUG_ENABLE_IPC_WARNINGS
@@ -484,56 +456,38 @@ static int deadlock(int function, struct proc *cp, endpoint_t src_dst_e)
 }
 
 
-static int has_pending(sys_map_t *map, int src_p, int asynm)
+static sys_id_t has_pending(sys_map_t *map, int src_p, int asynm)
 {
-    int src_id;
-    sys_id_t id = NULL_PRIV_ID;
-#ifdef CONFIG_SMP
-    struct proc *p;
-#endif
+
+    sys_id_t src_id = NULL_PRIV_ID;
 
     if (src_p != ANY) {
-        src_id = nr_to_id(src_p);
-        if (get_sys_bit(*map, src_id)) {
+        if (get_sys_bit(*map, src_p)) {
 #ifdef CONFIG_SMP
-            p = proc_addr(id_to_nr(src_id));
+            struct proc *p = proc_addr(src_p);
             if (asynm && RTS_ISSET(p, RTS_VMINHIBIT))
                 p->p_misc_flags |= MF_SENDA_VM_MISS;
             else
 #endif
-                id = src_id;
+                src_id = src_p;
         }
     } else {
-
-        for (src_id = 0; src_id < NR_SYS_PROCS; src_id += BITCHUNK_BITS) {
-            if (get_sys_bits(*map, src_id) != 0) {
+        for (int i = 0; i < NR_SYS_PROCS; i++) {
+            if (get_sys_bit(*map, i)) {
 #ifdef CONFIG_SMP
-                while (src_id < NR_SYS_PROCS) {
-                    while (!get_sys_bit(*map, src_id) && src_id < NR_SYS_PROCS) {
-                        src_id++;
-                    }
-					if (src_id == NR_SYS_PROCS)
-						goto quit_search;
-                    p = proc_addr(id_to_nr(src_id));
-                    if (asynm && RTS_ISSET(p, RTS_VMINHIBIT)) {
-                        p->p_misc_flags |= MF_SENDA_VM_MISS;
-                        src_id++;
-                    } else
-                        goto quit_search;
-                }
-#else
-                while (!get_sys_bit(*map, src_id)) src_id++;
-                goto quit_search;
+                struct proc *p = proc_addr(i);
+                if (asynm && RTS_ISSET(p, RTS_VMINHIBIT)) {
+                    p->p_misc_flags |= MF_SENDA_VM_MISS;
+                } else
 #endif
+                {
+                    src_id = i;
+                    break;
+                }
             }
         }
-
-quit_search:
-        if (src_id < NR_SYS_PROCS)
-            id = src_id;
     }
-
-    return id;
+    return src_id;
 }
 
 
@@ -557,7 +511,6 @@ void unset_notify_pending(struct proc * caller, int src_p)
 int mini_send(struct proc *caller_ptr, endpoint_t dst_e, message *m_ptr, const int flags)
 {
     struct proc *dst_ptr;
-    struct proc **xpp;
     int dst_p = _ENDPOINT_P(dst_e);
 
     dst_ptr = proc_addr(dst_p);
@@ -571,13 +524,13 @@ int mini_send(struct proc *caller_ptr, endpoint_t dst_e, message *m_ptr, const i
 
         assert(!(dst_ptr->p_misc_flags & MF_DELIVERMSG));
 
-        if (!(flags & FROM_KERNEL)) {
-            if(copy_msg_from_user(m_ptr, &dst_ptr->p_delivermsg))
-                return EFAULT;
-        } else {
+        if (flags & FROM_KERNEL) {
             dst_ptr->p_delivermsg = *m_ptr;
             IPC_STATUS_ADD_FLAGS(dst_ptr, IPC_FLG_MSG_FROM_KERNEL);
+        } else if(copy_msg_from_user(m_ptr, &dst_ptr->p_delivermsg)) {
+            return EFAULT;
         }
+
 
         dst_ptr->p_delivermsg.m_source = caller_ptr->p_endpoint;
         dst_ptr->p_misc_flags |= MF_DELIVERMSG;
@@ -596,23 +549,21 @@ int mini_send(struct proc *caller_ptr, endpoint_t dst_e, message *m_ptr, const i
 #endif
 
     } else {
-
         if(flags & NON_BLOCKING) {
             return ENOTREADY;
         }
 
 
-        if (deadlock(SEND, caller_ptr, dst_e)) {
+        if (deadlock(caller_ptr, dst_e, 1)) {
             return ELOCKED;
         }
 
 
-        if (!(flags & FROM_KERNEL)) {
-            if(copy_msg_from_user(m_ptr, &caller_ptr->p_sendmsg))
-                return EFAULT;
-        } else {
+        if (flags & FROM_KERNEL) {
             caller_ptr->p_sendmsg = *m_ptr;
             caller_ptr->p_misc_flags |= MF_SENDING_FROM_KERNEL;
+        } else if (copy_msg_from_user(m_ptr, &caller_ptr->p_sendmsg)) {
+            return EFAULT;
         }
 
         RTS_SET(caller_ptr, RTS_SENDING);
@@ -620,7 +571,7 @@ int mini_send(struct proc *caller_ptr, endpoint_t dst_e, message *m_ptr, const i
 
         assert(caller_ptr->p_q_link == NULL);
 
-        xpp = &dst_ptr->p_caller_q;
+        struct proc **xpp = &dst_ptr->p_caller_q;
         while (*xpp)
             xpp = &(*xpp)->p_q_link;
 
@@ -637,11 +588,11 @@ int mini_send(struct proc *caller_ptr, endpoint_t dst_e, message *m_ptr, const i
 
 static int mini_receive(struct proc * caller_ptr, endpoint_t src_e, message * m_buff_usr, const int flags)
 {
-
     struct proc **xpp;
-    int r, src_id, found, src_proc_nr;
+    int r, src_proc_nr;
     endpoint_t sender_e;
     int src_p;
+    sys_id_t src_id;
 
     assert(!(caller_ptr->p_misc_flags & MF_DELIVERMSG));
 
@@ -657,39 +608,35 @@ static int mini_receive(struct proc * caller_ptr, endpoint_t src_e, message * m_
 
     if (!RTS_ISSET(caller_ptr, RTS_SENDING)) {
 
-
         if (! (caller_ptr->p_misc_flags & MF_REPLY_PEND)) {
 
-
             src_id = has_pending_notify(caller_ptr, src_p);
-            found = (src_id != NULL_PRIV_ID);
 
-
-            if (found) {
-                src_proc_nr = id_to_nr(src_id);
+            if (src_id != NULL_PRIV_ID) {
+                src_proc_nr = src_id;
                 sender_e = proc_addr(src_proc_nr)->p_endpoint;
-            }
 
 
-            if (found && CANRECEIVE(src_e, sender_e, caller_ptr, 0, &m_notify_buff)) {
+                if (CANRECEIVE(src_e, sender_e, caller_ptr, 0, &m_notify_buff)) {
 #if DEBUG_ENABLE_IPC_WARNINGS
-                if(src_proc_nr == NONE) {
-                    printf("mini_receive: sending notify from NONE\n");
-                }
+                    if(src_proc_nr == NONE) {
+                        printf("mini_receive: sending notify from NONE\n");
+                    }
 #endif
-                assert(src_proc_nr != NONE);
-                unset_notify_pending(caller_ptr, src_id);
+                    assert(src_proc_nr != NONE);
+                    unset_notify_pending(caller_ptr, src_id);
 
-                assert(!(caller_ptr->p_misc_flags & MF_DELIVERMSG));
-                assert(src_e == ANY || sender_e == src_e);
+                    assert(!(caller_ptr->p_misc_flags & MF_DELIVERMSG));
+                    assert(src_e == ANY || sender_e == src_e);
 
-                BuildNotifyMessage(&caller_ptr->p_delivermsg, src_proc_nr, caller_ptr);
-                caller_ptr->p_delivermsg.m_source = sender_e;
-                caller_ptr->p_misc_flags |= MF_DELIVERMSG;
+                    BuildNotifyMessage(&caller_ptr->p_delivermsg, src_proc_nr, caller_ptr);
+                    caller_ptr->p_delivermsg.m_source = sender_e;
+                    caller_ptr->p_misc_flags |= MF_DELIVERMSG;
 
-                IPC_STATUS_ADD_CALL(caller_ptr, NOTIFY);
+                    IPC_STATUS_ADD_CALL(caller_ptr, NOTIFY);
 
-                goto receive_done;
+                    return OK;
+                }
             }
         }
 
@@ -699,7 +646,7 @@ static int mini_receive(struct proc * caller_ptr, endpoint_t src_e, message * m_
 
             if (r == OK) {
                 IPC_STATUS_ADD_CALL(caller_ptr, SENDA);
-                goto receive_done;
+                return OK;
             }
         }
 
@@ -738,7 +685,8 @@ static int mini_receive(struct proc * caller_ptr, endpoint_t src_e, message * m_
 
                 *xpp = sender->p_q_link;
                 sender->p_q_link = NULL;
-                goto receive_done;
+
+                return OK;
             }
 
             xpp = &sender->p_q_link;
@@ -748,7 +696,7 @@ static int mini_receive(struct proc * caller_ptr, endpoint_t src_e, message * m_
 
     if (!(flags & NON_BLOCKING)) {
 
-        if (deadlock(RECEIVE, caller_ptr, src_e)) {
+        if (deadlock(caller_ptr, src_e, 0)) {
             return ELOCKED;
         }
 
@@ -758,20 +706,13 @@ static int mini_receive(struct proc * caller_ptr, endpoint_t src_e, message * m_
     }
 
     return ENOTREADY;
-
-receive_done:
-
-    if (caller_ptr->p_misc_flags & MF_REPLY_PEND)
-        caller_ptr->p_misc_flags &= ~MF_REPLY_PEND;
-
-    return OK;
 }
 
 
 int mini_notify(const struct proc *caller_ptr, endpoint_t dst_e)
 {
     struct proc *dst_ptr;
-    int src_id;
+    sys_id_t src_id;
     int dst_p;
 
     if (!isokendpt(dst_e, &dst_p)) {
@@ -797,7 +738,6 @@ int mini_notify(const struct proc *caller_ptr, endpoint_t dst_e)
 
         return OK;
     }
-
 
     src_id = priv(caller_ptr)->s_id;
     set_sys_bit(priv(dst_ptr)->s_notify_pending, src_id);
@@ -827,3 +767,5 @@ int mini_notify(const struct proc *caller_ptr, endpoint_t dst_e)
         sizeof(tabent)) != OK) { \
         ASCOMPLAIN(caller_ptr, entry, "message entry"); \
     }
+
+

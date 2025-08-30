@@ -1,0 +1,82 @@
+proc.c에서 proc-gemini.c로의 리팩토링 분석 보고서
+1. 개요
+
+proc.c 파일을 proc-gemini.c로 리팩토링하는 과정에서 단순한 코드 개선을 넘어 핵심 기능의 대규모 제거 및 코드 단순화가 이루어졌습니다. proc-gemini.c는 기존 proc.c의 모든 기능을 포함하는 것이 아니라, 프로세스 스케줄링, 비동기(asynchronous) 메시징, FPU 관리 등 운영체제 커널의 주요 기능들이 제거된 **축소 버전(stripped-down version)**입니다.
+
+코드의 일부는 가독성 향상을 위해 개선되었지만, 많은 기능이 삭제되었으며 최종적으로 proc-gemini.c 파일은 불완전한 상태로 구문 오류를 포함하고 있어 컴파일이 불가능합니다.
+
+2. 주요 변경 사항
+
+대규모 기능 제거: 프로세스 스케줄링, 비동기 메시지 전송(SENDA), FPU 상태 관리 관련 코드가 모두 삭제되었습니다.
+
+코드 가독성 및 스타일 개선: 일부 함수(deadlock, set_idle_name 등)의 로직이 더 명확하고 현대적인 C 스타일로 변경되었습니다. 복잡한 제어 흐름(goto문)이 일부 정리되었습니다.
+
+문서 및 주석 제거: 파일의 역사, 설계 철학 등을 설명하는 상세한 주석들이 대부분 사라졌습니다.
+
+불완전한 코드: 파일 끝부분이 잘려나가 mini_senda 관련 기능이 누락되고 구문 오류가 발생한 상태입니다.
+
+3. 상세 분석
+
+3.1. 제거된 기능
+
+proc-gemini.c에서는 운영체제 커널의 핵심적인 기능들이 대거 제거되었습니다.
+
+제거된 기능 분류	관련 함수 및 내용	영향
+프로세스 스케줄링	enqueue, dequeue, pick_proc, notify_scheduler, proc_no_time 등	실행 가능한 프로세스를 큐에 넣고, 다음 실행할 프로세스를 선택하는 스케줄링 로직이 완전히 사라졌습니다. CPU는 더 이상 어떤 프로세스를 실행해야 할지 결정할 수 없습니다.
+비동기 메시징 (SENDA)	mini_senda, try_deliver_senda, try_async, try_one, cancel_async 등	여러 개의 비동기 메시지를 한 번에 보내는 SENDA 시스템 콜 관련 기능이 모두 제거되었습니다. 동기(synchronous) IPC만 일부 남아있습니다.
+FPU 관리	copr_not_available_handler, release_fpu 등	부동소수점 장치(FPU)의 상태를 저장하고 복원하는 컨텍스트 스위칭 기능이 제거되었습니다. FPU를 사용하는 프로세스를 올바르게 처리할 수 없습니다.
+유틸리티 및 디버깅	endpoint_lookup, isokendpt_f, ser_dump_proc, reset_proc_accounting 등	엔드포인트 유효성 검사, 프로세스 정보 덤프, 통계 초기화 등 보조 기능들이 삭제되었습니다.
+매크로 및 전역 변수	BuildNotifyMessage, m_notify_buff 등	알림 메시지를 생성하던 매크로와 관련 버퍼가 제거되어 해당 로직을 수행할 수 없습니다.
+3.2. 코드 개선 및 변경 사항
+
+기능 제거 외에, 남아있는 코드 중 일부는 가독성과 효율성을 높이는 방향으로 수정되었습니다.
+
+1. deadlock 함수 시그니처 및 로직 개선
+교착 상태를 탐지하는 함수의 인터페이스가 훨씬 명확해졌습니다.
+
+기존 (proc.c):
+
+C
+static int deadlock(int function, register struct proc *caller, endpoint_t src_dst_e) 
+function이라는 모호한 정수 인자를 받아 비트 연산으로 상태를 확인하여 직관적이지 않았습니다.
+
+변경 후 (proc-gemini.c):
+
+C
+static int deadlock(struct proc *caller, endpoint_t src_dst_e, int is_send)
+is_send라는 명시적인 인자를 통해 현재 동작이 'send'인지 'receive'인지 직접 전달받아 로직의 가독성이 크게 향상되었습니다.
+
+2. set_idle_name 함수 단순화
+IDLE 프로세스의 이름을 설정하는 로직이 더 간결하고 효율적으로 변경되었습니다.
+
+기존 (proc.c): 복잡한 수동 계산 로직을 사용했습니다.
+
+변경 후 (proc-gemini.c): memcpy와 표준적인 나머지/나누기 연산(%, /)을 사용하여 코드가 훨씬 이해하기 쉬워졌습니다.
+
+3. switch_to_user 함수 제어 흐름 개선
+프로세스 컨텍스트를 유저 모드로 전환하는 함수의 복잡한 goto 사용이 일부 정리되어 코드의 흐름을 파악하기가 더 용이해졌습니다.
+
+4. 디버깅 코드 및 주석 제거
+#if DEBUG_ENABLE_IPC_WARNINGS와 같은 디버깅용 코드 블록과 오래된 주석들이 제거되어 코드가 전반적으로 깔끔해졌습니다.
+
+3.3. 불완전한 코드 및 구문 오류
+
+proc-gemini.c 파일은 마지막 부분이 잘려나가 불완전한 상태입니다.
+mini_senda 함수 호출과 관련된 ASCOMPLAIN, A_RETR, A_INSRT 매크로는 정의되어 있으나, 정작 이 매크로들을 사용하는 try_deliver_senda와 mini_senda 함수 구현부가 없습니다. 파일 마지막은 다음과 같이 비정상적으로 끝납니다.
+
+C
+#define A_INSRT(entry) do {   \
+    if (data_copy(KERNEL, (vir_bytes) &tabent, \
+        caller_ptr->p_endpoint, table_v + (entry)*sizeof(asynmsg_t), \
+        sizeof(tabent)) != OK) { \
+        ASCOMPLAIN(caller_ptr, entry, "message entry"); \
+    }
+} // 이 부분 뒤의 코드가 누락됨
+} // 불필요한 닫는 괄호로 인해 구문 오류 발생
+4. 결론
+
+proc-gemini.c는 proc.c의 완전한 대체재가 아닌, 특정 목적(예: 교육, 특정 IPC 기능만 테스트 등)을 위해 커널의 핵심 기능을 의도적으로 제거한 버전으로 판단됩니다.
+
+보고서 작성 시 다음과 같이 정리할 수 있습니다.
+
+proc.c에서 proc-gemini.c로의 변경은 단순 리팩토링이 아닌, **기능 축소(Feature Reduction)**에 가깝다. 이 과정에서 프로세스 스케줄링, 비동기 IPC, FPU 관리와 같은 핵심 커널 기능이 제거되었다. 남아있는 코드 중 일부는 deadlock 함수의 인터페이스 개선처럼 가독성과 명확성을 높이는 방향으로 수정되었으나, 최종 결과물은 불완전하여 실제 사용이 불가능한 상태이다. 따라서 proc-gemini.c는 전체 시스템을 구동하기 위한 파일이 아니라, 기본 IPC 동작만을 분리하여 분석하기 위한 학습용 또는 테스트용 코드로 보인다.

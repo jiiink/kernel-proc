@@ -93,9 +93,6 @@ static void set_idle_name(char * name, int n)
 }
 
 
-#define PICK_ANY	1
-#define PICK_HIGHERONLY	2
-
 #define BuildNotifyMessage(m_ptr, src, dst_ptr) \
 	memset((m_ptr), 0, sizeof(*(m_ptr)));				\
 	(m_ptr)->m_type = NOTIFY_MESSAGE;				\
@@ -483,7 +480,7 @@ static int do_sync_ipc(struct proc * caller_ptr, /* who made the call */
 {
   int result;					/* the system call's result */
   int src_dst_p;				/* Process slot number */
-  char *callname;
+  const char *callname;
 
   /* Check destination. RECEIVE is the only call that accepts ANY (in addition
    * to a real endpoint). The other calls (SEND, SENDREC, and NOTIFY) require an
@@ -1053,9 +1050,9 @@ static int mini_receive(struct proc * caller_ptr,
     xpp = &caller_ptr->p_caller_q;
     while (*xpp) {
 	struct proc * sender = *xpp;
-	endpoint_t sender_e = sender->p_endpoint;
+	endpoint_t se = sender->p_endpoint;
 
-        if (CANRECEIVE(src_e, sender_e, caller_ptr, 0, &sender->p_sendmsg)) {
+        if (CANRECEIVE(src_e, se, caller_ptr, 0, &sender->p_sendmsg)) {
             int call;
 	    assert(!RTS_ISSET(sender, RTS_SLOT_FREE));
 	    assert(!RTS_ISSET(sender, RTS_NO_ENDPOINT));
@@ -1209,7 +1206,6 @@ int try_deliver_senda(struct proc *caller_ptr,
   struct priv *privp;
   asynmsg_t tabent;
   const vir_bytes table_v = (vir_bytes) table;
-  message *m_ptr = NULL;
 
   privp = priv(caller_ptr);
 
@@ -1650,7 +1646,7 @@ void enqueue(
 #endif
 
   /* Make note of when this process was added to queue */
-  read_tsc_64(&(get_cpulocal_var(proc_ptr)->p_accounting.enter_queue));
+  read_tsc_64(&(rp->p_accounting.enter_queue));
 
 
 #if DEBUG_SANITYCHECKS
@@ -1698,7 +1694,7 @@ static void enqueue_head(struct proc *rp)
   }
 
   /* Make note of when this process was added to queue */
-  read_tsc_64(&(get_cpulocal_var(proc_ptr->p_accounting.enter_queue)));
+  read_tsc_64(&(rp->p_accounting.enter_queue));
 
 
   /* Process accounting for scheduling */

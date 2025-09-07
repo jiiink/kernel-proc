@@ -2,6 +2,7 @@
  * Together with "mpx.s" it forms the lowest layer of the MINIX kernel.
  * There is one entry point from the outside:
  *
+
  *   sys_call: 	      a system call, i.e., the kernel is trapped with an INT
  *
  * Changes:
